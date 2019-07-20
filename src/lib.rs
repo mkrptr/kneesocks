@@ -1,4 +1,3 @@
-extern crate reqwest;
 use std::net::TcpListener;
 use std::net::TcpStream;
 

@@ -36,35 +36,20 @@ impl From<u8> for RequestAddressType {
 
 struct SocksConnection {
     dst_socket_addr: SocketAddr,
-    tcp_stream: TcpStream
+    server_socket_addr: SocketAddr,
+    client_stream: TcpStream
 }
 
-struct Server {
-    listener: TcpListener
-}
-
-impl Server {
-    fn new(full_address: String) -> std::result::Result<Self, String> {
-        if let Ok(listener) = TcpListener::bind(&full_address) {
-            return Ok(Server {
-                listener
-            });
+impl SocksConnection {
+    fn new(client_stream: TcpStream, server_socket_addr: SocketAddr) -> Self {
+        SocksConnection {
+            client_stream,
+            server_socket_addr,
+            dst_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::from([0,0,0,0])), 8080)
         }
-        Err(format!("Couldn't bind to address {}", full_address))
-    }
-    
-    fn server_loop(&mut self) -> Result<()> {
-        for stream in self.listener.incoming() {
-            match self.handle_connection(stream?) {
-                Ok(_) => println!("handled successfully"),
-                Err(error) => println!("error: {}", error)
-            }
-            println!("connection closed");
-        }
-        Ok(())
     }
 
-    fn process_client_request(&self, client_stream: &mut TcpStream) -> std::result::Result<(), String> {
+    fn process_client_request(&mut self) -> std::result::Result<(), String> {
         /*
           The SOCKS request is formed as follows:
 
@@ -74,34 +59,35 @@ impl Server {
         | 1  |  1  | X'00' |  1   | Variable |    2     |
         +----+-----+-------+------+----------+----------+
          */
+        println!("Processing client's request");
         let mut buffer: [u8;512] = [0; 512];
-        if let Err(_) = client_stream.read(&mut buffer) {
+        if let Err(_) = self.client_stream.read(&mut buffer) {
             return Err(String::from("couldn't read from stream"));
         }
-  
+        println!("{:x?}", &buffer[..]);
         let mut address_type: RequestAddressType = RequestAddressType::InvalidAddress;
         let socks_version = buffer[0];
         assert_eq!(socks_version, 5);
         let command = buffer[1];
-        let mut dst_socket_addr: SocketAddr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::from([0,0,0,0])), 8080);
+        println!("request address type: {}", buffer[3]);
+
         match RequestAddressType::from(buffer[3]) {
             RequestAddressType::IPv4 => {
-                named!(parse_ipv4<IpAddr>,
+                named!(parse_ipv4<SocketAddr>,
                        do_parse!(
                            a: be_u8 >>
                            b: be_u8 >>
                            c: be_u8 >>
                            d: be_u8 >>
-                           (IpAddr::V4(Ipv4Addr::new(a, b, c, d)))
+                           port: be_u16 >>
+                           (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), port))
                        ));
-                let address =  parse_ipv4(&buffer[4..8]);
-                let port = ((buffer[8] as u16) << 8) | (buffer[8] as u16);
-                if let Ok((_, ip_addr)) = address {
+                let address = parse_ipv4(&buffer[4..10]);
+                if let Ok((_, sock_addr)) = address {
                     address_type = RequestAddressType::IPv4;
-                    dst_socket_addr = SocketAddr::new(ip_addr, port);
+                    self.dst_socket_addr = sock_addr;
                 } else {
-                    return Err(format!("Can't parse ipv4 address : {:?}", &buffer[4..8]));
+                    return Err(format!("Can't parse ipv4 address : {:?}", &buffer[4..10]));
                 }
             },
             RequestAddressType::DomainName => {
@@ -119,7 +105,7 @@ impl Server {
                             match sock_iter.next() {
                                 Some(sock_addr) => {
                                     address_type = RequestAddressType::DomainName;
-                                    dst_socket_addr = sock_addr;
+                                    self.dst_socket_addr = sock_addr;
                                 },
                                 None => {
                                     return Err(format!("Couldn't parse fqdn socket address: {}", socket_str));
@@ -148,7 +134,7 @@ impl Server {
                 let ip_addr_res = parse_ipv6(&buffer[4..20]);
                 if let Ok((_, sock_addr)) = ip_addr_res {
                     address_type = RequestAddressType::IPv6;
-                    dst_socket_addr = sock_addr;
+                    self.dst_socket_addr = sock_addr;
                 } else {
                     return Err(format!("Couldn't parse socket addr: {:?}", ip_addr_res));
                 }
@@ -156,34 +142,35 @@ impl Server {
             RequestAddressType::InvalidAddress => {
                 return Err(String::from("Invalid address"));
             }
+             
+        }
 
-        }
+        println!("dst_socket_addr : {}", self.dst_socket_addr);
         //TODO: add support for bind and udpassociate commands
-        if let Ok(server_stream) = TcpStream::connect(dst_socket_addr) {
-            let mut server_response: [u8;512] = [0;512];
-            server_response[0] = socks_version;
-            server_response[1] = 0;
-            server_response[2] = 0;
-            server_response[3] = address_type as u8;
-            let mut local_addr_octets: Vec<u8>  = match self.listener.local_addr().unwrap().ip() {
-                IpAddr::V4(ip) => ip.octets().to_vec(),
-                IpAddr::V6(ip) => ip.octets().to_vec(),
-            };
-            let local_addr_port = self.listener.local_addr().unwrap().port();
-            local_addr_octets.push((local_addr_port >> 8) as u8);
-            local_addr_octets.push(local_addr_port as u8);
-            server_response[4..4+local_addr_octets.len()]
-                .clone_from_slice(local_addr_octets.as_slice());
-            client_stream.write(&server_response);
-            client_stream.flush();
-           //server_response = [socks_version, 0,0,address_type as u8, local_add] 
-            //server_stream.write(buf: &[u8])
-        }
+        let mut server_response: [u8;512] = [0;512];
+        server_response[0] = socks_version;
+        server_response[1] = 0;
+        server_response[2] = 0;
+        server_response[3] = address_type as u8;
+        let mut local_addr_octets: Vec<u8>  = match self.server_socket_addr.ip() {
+            IpAddr::V4(ip) => ip.octets().to_vec(),
+            IpAddr::V6(ip) => ip.octets().to_vec(),
+        };
+        let local_addr_port = self.server_socket_addr.port();
+        local_addr_octets.push((local_addr_port >> 8) as u8);
+        local_addr_octets.push(local_addr_port as u8);
+        server_response[4..4+local_addr_octets.len()]
+            .clone_from_slice(local_addr_octets.as_slice());
+
+        println!("Server response: {:x?}", &server_response[..]);
+        self.client_stream.write(&server_response[..4+local_addr_octets.len()]);
+        self.client_stream.flush();
+        //server_response = [socks_version, 0,0,address_type as u8, local_add] 
+        //server_stream.write(buf: &[u8])
         Ok(())
     }
 
-    fn authenticate_client(&self, client_stream: &mut TcpStream)
-                           -> std::result::Result<(), String>{
+    fn authenticate_client(&mut self) -> std::result::Result<(), String>{
         /*
         +----+----------+----------+
         |VER | NMETHODS | METHODS  |
@@ -192,11 +179,12 @@ impl Server {
         +----+----------+----------+
 
          */
-
+        println!("Authenticating client");
         let mut buffer: [u8;512] = [0; 512];
-        if let Err(_) = client_stream.read(&mut buffer) {
+        if let Err(_) = self.client_stream.read(&mut buffer) {
             return Err(String::from("couldn't read from stream"));
         }
+        println!("{:x?}", &buffer[..]);
         let socks_version = buffer[0];
         if socks_version != 5 {
             return Err(format!("Expected socks version 5, given: {}", socks_version));
@@ -209,50 +197,272 @@ impl Server {
         for method_byte in 0..number_of_methods {
             methods.push(AuthenticationMethods::from(buffer[2+method_byte as usize]));
         }
-        if let Ok(_bytes_written) = client_stream.write(&[socks_version,
-                                                         std::mem::replace(methods.first_mut().unwrap(),
-                                                         AuthenticationMethods::InvalidMethod) as u8]) {
+        if let Ok(_bytes_written) = self.client_stream.write(&[socks_version,
+                                     std::mem::replace(methods.first_mut().unwrap(),
+                                     AuthenticationMethods::InvalidMethod) as u8]) {
             //TODO: logs
-            client_stream.flush();
+            self.client_stream.flush();
         }
+        println!("Authenticated succesfully");
         Ok(())
     }
 
-    fn perform_request(&self, client_stream: &mut TcpStream) -> std::result::Result<(), String> {
-        let mut buffer: [u8;512] = [0; 512];
-        if let Err(_) = client_stream.read(&mut buffer) {
+    fn perform_request(&mut self) -> std::result::Result<(), String> {
+        let mut buffer: [u8;8192] = [0; 8192];
+        let mut benis = String::new();
+            
+       // self.client_stream.read_to_string(&mut benis);
+       // println!("{:x?}", benis.as_bytes());
+        //return Ok(());
+ /*       
+        if let Err(_) = self.client_stream.read(&mut buffer) {
             return Err(String::from("couldn't read from stream"));
         }
-        let mut request_string = String::from_utf8_lossy(&buffer);
-        /*
-        lazy_static! {
-            static ref ADDRESS_REGEX: Regex = Regex::new(r"(?:Host: )(.+)(?:\s+)")
-                .unwrap();
-        }
+*/
+        let mut bytes_written = match self.client_stream.read(&mut buffer) {
+            Ok(n) => n,
+            Err(_) => {
+                return Err(String::from("Couldn't read from client's stream"));
+            }
+        };
+        println!("{}", String::from_utf8_lossy(&buffer));
+        println!("{:x?}", &buffer[..bytes_written]);
+        let mut conn: TcpStream = match TcpStream::connect(self.dst_socket_addr) {
+            Ok(stream) => {
+                println!("Connected to {}", self.dst_socket_addr);
+                stream
+            },
+            Err(message) => {
+                return Err(format!("Coudln't connect to destination address. : {}", message));
+            }
+        };
+        conn.write(&buffer[..bytes_written]);
+        conn.flush();
 
-        let host_address = &ADDRESS_REGEX
-            .captures(&request_string);
-         */
-        
-        if let Some(ad) = host_address {
-            println!("host adress is {}", ad[1].trim_end());
-            //ad[1].trim_end()
-            //let req_str = &ADDRESS_REGEX.replace_all(&request_string, "Host: google.com\r\n");
-            let mut conn = TcpStream::connect(format!("{}",ad[1].trim_end()));
-            println!("{}", req_str);
-            conn.write(req_str.as_bytes());
-            conn.flush();
-            buffer = [0;512];
+        buffer = [0;8192];
+
+        bytes_written = match conn.read(&mut buffer) {
+            Ok(n) => n,
+            Err(_) => {
+                return Err(String::from("Couldn't read from client's stream"));
+            }
+        };
+        println!("entire resp: {:x?}", &buffer[..]);
+        //println!("HTTP response is {}", String::from_utf8_lossy(&buffer));
+        //println!("bytes are : {:x?}", &buffer[0..bytes_written]);
+        if buffer[0] == 0x16 {
+            println!("performing tls handshake");
+            named!(server_req1<usize>,
+                   do_parse!(
+                       protocol_type: be_u8 >>
+                       version: take!(2) >>
+                       length: be_u16 >>
+                       ((length + 5) as usize)
+                   ));
+            let mut next_index: usize = 0;
+            if let Ok((_,len)) = server_req1(&buffer) {
+                println!("len: {}", len);
+                println!("Server hello: \n{:x?}", &buffer[next_index..len+next_index]);
+                self.client_stream.write(&buffer[next_index..len+next_index]);
+                self.client_stream.flush();
+                next_index = len ;
+            }
+            if let Ok((_,len)) = server_req1(&buffer[next_index..]) {
+                println!("len: {}", len);
+                println!("Server certificate: {:x?}", &buffer[next_index..len+next_index]);
+                self.client_stream.write(&buffer[next_index..len+next_index]);
+                self.client_stream.flush();
+                next_index += len;
+            }
+            //println!("next_index after cert: {}", next_index);
+            //println!("boof: {:x?}", &buffer[next_index..]);
+            if let Ok((_, len)) = server_req1(&buffer[next_index..]) {
+                println!("len: {}", len);
+                println!("Server Key Exchange:  \n {:x?}", &buffer[next_index..len+next_index]);
+                self.client_stream.write(&buffer[next_index..len+next_index]);
+                self.client_stream.flush();
+                next_index += len;
+            }
+            if let Ok((_, len)) = server_req1(&buffer[next_index..]) {
+                println!("len: {}", len);
+                println!("Server Hello Done: \n {:x?}",  &buffer[next_index..len+next_index]);
+                self.client_stream.write(&buffer[next_index..len+next_index]);
+                self.client_stream.flush();
+            }
+            println!("sent server part successfully");
+            buffer = [0;8192];
+            next_index = 0;
+            self.client_stream.read(&mut buffer[..]);
+            //println!("{:x?}", &buffer[..]);
+            if let Ok((_,len)) = server_req1(&buffer) {
+                println!("len: {}", len);
+                //println!("Server hello: \n{:x?}", &buffer[next_index..len+next_index]);
+                conn.write(&buffer[next_index..len+next_index]);
+                conn.flush();
+                next_index = len ;
+            }
+            if let Ok((_,len)) = server_req1(&buffer[next_index..]) {
+                println!("len: {}", len);
+                //println!("Server certificate: {:x?}", &buffer[next_index..len+next_index]);
+                conn.write(&buffer[next_index..len+next_index]);
+                conn.flush();
+                next_index += len;
+            }
+            if let Ok((_,len)) = server_req1(&buffer[next_index..]) {
+                println!("len: {}", len);
+                //println!("Server certificate: {:x?}", &buffer[next_index..len+next_index]);
+                conn.write(&buffer[next_index..len+next_index]);
+                conn.flush();
+                next_index += len;
+            }
+            println!("client handshake finished");
+            buffer = [0;8192];
+            next_index = 0;
             conn.read(&mut buffer);
-
-            client_stream.write(&mut buffer)?;
+            //println!("{:x?}", &buffer[..]);
+            if let Ok((_,len)) = server_req1(&buffer) {
+                println!("len: {}", len);
+                //println!("Server hello: \n{:x?}", &buffer[next_index..len+next_index]);
+                self.client_stream.write(&buffer[next_index..len+next_index]);
+                self.client_stream.flush();
+                next_index = len ;
+            }
+            if let Ok((_,len)) = server_req1(&buffer[next_index..]) {
+                println!("len: {}", len);
+                //println!("Server certificate: {:x?}", &buffer[next_index..len+next_index]);
+                self.client_stream.write(&buffer[next_index..len+next_index]);
+                self.client_stream.flush();
+                next_index += len;
+            }
+            if let Ok((_,len)) = server_req1(&buffer[next_index..]) {
+                println!("len: {}", len);
+                //println!("Server certificate: {:x?}", &buffer[next_index..len+next_index]);
+                self.client_stream.write(&buffer[next_index..len+next_index]);
+                self.client_stream.flush();
+            }
+            println!("server handshake finished");
+            buffer = [0;8192];
+            next_index = 0;
+            self.client_stream.read(&mut buffer[..]);
+            //println!("{:x?}", &buffer[..]);
+            if let Ok((_,len)) = server_req1(&buffer) {
+                println!("len: {}", len);
+                //println!("Server hello: \n{:x?}", &buffer[next_index..len+next_index]);
+                conn.write(&buffer[next_index..len+next_index]);
+                conn.flush();
+                next_index = len ;
+            }
+            if let Ok((_,len)) = server_req1(&buffer[next_index..]) {
+                println!("len: {}", len);
+                //println!("Server certificate: {:x?}", &buffer[next_index..len+next_index]);
+                conn.write(&buffer[next_index..len+next_index]);
+                conn.flush();
+                next_index += len;
+            }
+            if let Ok((_,len)) = server_req1(&buffer[next_index..]) {
+                println!("len: {}", len);
+                //println!("Server certificate: {:x?}", &buffer[next_index..len+next_index]);
+                conn.write(&buffer[next_index..len+next_index]);
+                conn.flush();
+                next_index += len;
+            }
+            println!("ping, i guess");
+            buffer = [0;8192];
+            next_index = 0;
+            conn.read(&mut buffer);
+            //println!("{:x?}", &buffer[..]);
+            if let Ok((_,len)) = server_req1(&buffer) {
+                println!("len: {}", len);
+                //println!("Server hello: \n{:x?}", &buffer[next_index..len+next_index]);
+                self.client_stream.write(&buffer[next_index..len+next_index]);
+                self.client_stream.flush();
+                next_index = len ;
+            }
+            
+            /*
+            if let Ok((_,len)) = server_req1(&buffer[next_index..]) {
+                println!("len: {}", len);
+                //println!("Server certificate: {:x?}", &buffer[next_index..len+next_index]);
+                self.client_stream.write(&buffer[next_index..len+next_index]);
+                self.client_stream.flush();
+                next_index += len;
+            }
+            if let Ok((_,len)) = server_req1(&buffer[next_index..]) {
+                println!("len: {}", len);
+                //println!("Server certificate: {:x?}", &buffer[next_index..len+next_index]);
+                self.client_stream.write(&buffer[next_index..len+next_index]);
+                self.client_stream.flush();
+            }
+*/
+            /*
+            bytes_written = match self.client_stream.write(&buffer[0..bytes_written]) {
+                Ok(n) => n,
+                _ => {
+                    return Err(String::from("Couldn't write to client' stream"));
+                }
+            };
+            self.client_stream.flush();
+            buffer = [0;8192];
+            self.client_stream.read(&mut buffer);
+            println!("bytes are: {:x?}", &buffer[..]);
+            */
+        } else {
+            bytes_written = match self.client_stream.write(&buffer[0..bytes_written]) {
+                Ok(n) => n,
+                _ => {
+                    return Err(String::from("Couldn't write to client' stream"));
+                }
+            };
         }
+       
+       
+
+        Ok(())
+    }
+    
+    fn handle_connection(&mut self) -> std::result::Result<(), String> {
+        self.authenticate_client()?;
+        self.process_client_request()?;
+        self.perform_request()?;
+        Ok(())
     }
 
-    fn handle_connection(&self, mut client_stream: TcpStream) -> std::result::Result<(), String> {
-        self.authenticate_client(&mut client_stream)?;
-        self.process_client_request(&mut client_stream)?;
-        self.perform_request(&mut client_stream)?;
+    
+    fn handle_stream(&mut self) -> std::result::Result<(), String>{
+        self.handle_connection()?;
+        Ok(())
+    }
+}
+
+struct Server {
+    listener: TcpListener
+}
+
+impl Server {
+    fn new(full_address: String) -> std::result::Result<Self, String> {
+        if let Ok(listener) = TcpListener::bind(&full_address) {
+            return Ok(Server {
+                listener
+            });
+        }
+        Err(format!("Couldn't bind to address {}", full_address))
+    }
+    
+    fn server_loop(&mut self) -> Result<()> {
+        for stream in self.listener.incoming() {
+            println!("Attempting to handle connection");
+            let mut socks_conn = SocksConnection::new(
+                stream.unwrap(),
+                self.listener.local_addr().unwrap()
+            );
+            
+            match socks_conn.handle_stream() {
+                Ok(()) => {},
+                Err(message) => println!("{}", message)
+            }
+            
+            println!("connection closed");
+        }
         Ok(())
     }
 }
@@ -369,7 +579,7 @@ fn main() {
         Err(message) => panic!("{}", message)
     }
     if let Ok(()) = server.server_loop() {
-
+        println!("Server bind success.");
     }
     else {
         println!("Oopsie fucky wucky UwU")

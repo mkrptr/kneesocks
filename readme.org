@@ -1,0 +1,28 @@
+* Kneesocks
+Kneesocks is a socks5 proxy server. Right now it supports basic multithreading, 
+but I'm going to rewrite it in mio soon.
+
+* Getting Started
+** Prerequisites
+  - cargo
+** Installation 
+  1. Clone this repository
+  #+BEGIN_SRC sh
+  git clone https://yaddayadda 
+  #+END_SRC
+  
+  2. Move to kneesocks directory
+  #+BEGIN_SRC sh
+  cd kneesocks
+  #+END_SRC
+   
+  3. Build kneesocks
+  #+BEGIN_SRC sh
+  cargo build 
+  #+END_SRC
+
+** Usage
+ Start the server on localhost with port 8080
+ #+BEGIN_SRC sh
+ target/debug/kneesocks -a 127.0.0.1 -p 8080
+ #+END_SRC

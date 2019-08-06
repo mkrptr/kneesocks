@@ -350,25 +350,25 @@ impl SocksConnection {
         info!("Redirecting all data between streams");
         
         let to_client_handle: JoinHandle<io::Result<()>> = thread::spawn(move || {
-            copy(&mut remote_to_proxy, &mut proxy_to_client)?;
-            info!("client_handle finished ");
-            remote_to_proxy.shutdown(Shutdown::Read)?;
-            proxy_to_client.shutdown(Shutdown::Write)?;
-            info!("client_handle closed");
+            copy(&mut remote_to_proxy, &mut proxy_to_client).and_then(|_| {
+                remote_to_proxy.shutdown(Shutdown::Read)?;
+                proxy_to_client.shutdown(Shutdown::Write)?;
+                Ok(())
+            }).expect("copy remote to client failed");
             Ok(())
         });
 
         let to_remote_handle: JoinHandle<io::Result<()>> = thread::spawn(move || {
-            copy(&mut client_to_proxy, &mut proxy_to_remote)?;
-            info!("remote_handle finished ");
-            client_to_proxy.shutdown(Shutdown::Read)?;
-            proxy_to_remote.shutdown(Shutdown::Write)?;
-            info!("remote_handle closed");
+            copy(&mut client_to_proxy, &mut proxy_to_remote).and_then(|_| {
+                client_to_proxy.shutdown(Shutdown::Read)?;
+                proxy_to_remote.shutdown(Shutdown::Write)?;
+                Ok(())
+            }).expect("copy client to remote failed");
             Ok(())
         });
 
-        //to_client_handle.join().unwrap()?;
-        //to_remote_handle.join().unwrap()?;
+        to_client_handle.join().unwrap()?;
+        to_remote_handle.join().unwrap()?;
         info!("Redirecting finished");
         Ok(())
     }

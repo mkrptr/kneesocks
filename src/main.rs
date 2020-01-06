@@ -13,6 +13,7 @@ use std::mem::replace;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, Shutdown};
 use std::thread;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 enum AuthenticationMethod {
     NoAuth,
@@ -97,21 +98,22 @@ fn build_socks_response(socks_version: u8, error_code: u8,
         +----+-----+-------+------+----------+----------+
         */
 
-        let mut server_response: [u8; 512] = [0; 512];
-        server_response[0] = socks_version;
-        server_response[1] = error_code;
-        server_response[2] = 0; // Reserved
-        server_response[3] = std::mem::replace(address_type,
-                                               RequestAddressType::InvalidAddress) as u8;
-        let mut local_addr_octets: Vec<u8> = match address.ip() {
-            IpAddr::V4(ip) => ip.octets().to_vec(),
-            IpAddr::V6(ip) => ip.octets().to_vec()
-        };
-        let local_addr_port = address.port();
-        local_addr_octets.push((local_addr_port >> 8) as u8);
-        local_addr_octets.push(local_addr_port as u8);
-        server_response[4..4 + local_addr_octets.len()]
-            .clone_from_slice(local_addr_octets.as_slice());
+    let mut server_response: [u8; 512] = [0; 512];
+    server_response[0] = socks_version;
+    server_response[1] = error_code;
+    server_response[2] = 0; // Reserved
+    server_response[3] = std::mem::replace(address_type,
+                                           RequestAddressType::InvalidAddress) as u8;
+    let mut local_addr_octets: Vec<u8> = match address.ip() {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec()
+    };
+    let local_addr_port = address.port();
+    local_addr_octets.push((local_addr_port >> 8) as u8);
+    local_addr_octets.push(local_addr_port as u8);
+    server_response[4..4 + local_addr_octets.len()]
+        .clone_from_slice(local_addr_octets.as_slice());
+    debug!("Socks response: {:x?}", &server_response[..4+local_addr_octets.len()]);
     return Ok((server_response, 4+local_addr_octets.len()));
 }
 
@@ -182,13 +184,30 @@ fn get_ipv6_address(buffer: &[u8]) -> std::result::Result<SocketAddr, String> {
     }
 }
 
+fn forward_stream(mut src: TcpStream, mut dst: TcpStream) {
+    src.set_read_timeout(Some(Duration::from_millis(5000))).unwrap();
+    dst.set_read_timeout(Some(Duration::from_millis(5000))).unwrap();
+
+    if let Err(msg) = copy(&mut src, &mut dst) {
+        error!("forward error: {}", msg);
+    }
+    src.shutdown(Shutdown::Read).unwrap_or_else(|err| {
+        error!("couldn't shutdown for read: {}", err);
+        dst.shutdown(Shutdown::Both);
+    });
+    dst.shutdown(Shutdown::Write).unwrap_or_else(|err| {
+        error!("couldn't shutdown for write: {}", err);
+        src.shutdown(Shutdown::Both);
+    });
+}
+
 impl SocksConnection {
     fn new(client_stream: TcpStream) -> Self {
         SocksConnection {
             client_stream,
         }
     }
-    
+
     fn establish_connection(&self, dst_socket_addr: SocketAddr) -> Result<TcpStream, u8> {
         /*
         o  REP    Reply field:
@@ -209,13 +228,13 @@ impl SocksConnection {
             Err(err) => {
                 error_field = match err.kind() {
                     io::ErrorKind::ConnectionRefused => 5,
-                        
+
                     io::ErrorKind::AddrNotAvailable => 4,
 
                     io::ErrorKind::Interrupted |
                     io::ErrorKind::BrokenPipe |
                     _ => 1,
-                        
+
                 };
                 return Err(error_field);
             }
@@ -236,10 +255,13 @@ impl SocksConnection {
          */
         info!("Processing client's request");
         let mut buffer: [u8; 512] = [0; 512];
-        if let Err(_) = self.client_stream.read(&mut buffer) {
-            return Err(String::from("couldn't read from stream"));
-        }
-        debug!("Request info raw data: \n{:x?}", &buffer[..]);
+        let bytes_read = match self.client_stream.read(&mut buffer) {
+            Ok(bytes_n) => bytes_n,
+            Err(msg) => {
+                return Err(format!("couldn't read from stream: {}", msg));
+            }
+        };
+        debug!("Request info raw data: \n{:x?}", &buffer[..bytes_read]);
         let socks_version = buffer[0];
         let request_command = RequestCommandMode::from(buffer[1]);
         let address_type = RequestAddressType::from(buffer[3]);
@@ -297,10 +319,13 @@ impl SocksConnection {
          */
         info!("Client connected to socks");
         let mut buffer: [u8; 512] = [0; 512];
-        if let Err(_) = self.client_stream.read(&mut buffer) {
-            return Err(String::from("couldn't read from stream"));
-        }
-        debug!("Request raw data: {:x?}", &buffer[..]);
+        let bytes_read = match self.client_stream.read(&mut buffer) {
+            Ok(bytes_n) => bytes_n,
+            Err(msg) => {
+                return Err(format!("couldn't read from stream: {}", msg));
+            }
+        };
+        debug!("Request raw data: {:x?}", &buffer[..bytes_read]);
         let socks_version = buffer[0];
         if socks_version != 5 {
             return Err(format!(
@@ -326,6 +351,7 @@ impl SocksConnection {
                 selected_method,
             ])
             .expect("Couldn't write to stream while authenticating");
+        debug!("auth response: {:x?}", &[socks_version, selected_method]);
         self.client_stream.flush().expect("Couldn't flush stream");
 
         match AuthenticationMethod::from(selected_method) {
@@ -339,7 +365,6 @@ impl SocksConnection {
         info!("Authenticated succesfully");
         Ok(())
     }
-
     fn do_connect(&mut self, remote_stream: TcpStream) -> io::Result<()> {
         info!("Performing connect request");
         let mut remote_to_proxy = remote_stream.try_clone()?;
@@ -348,22 +373,14 @@ impl SocksConnection {
         let mut proxy_to_client = self.client_stream.try_clone()?;
 
         info!("Redirecting all data between streams");
-        
+
         let to_client_handle: JoinHandle<io::Result<()>> = thread::spawn(move || {
-            copy(&mut remote_to_proxy, &mut proxy_to_client).and_then(|_| {
-                remote_to_proxy.shutdown(Shutdown::Read)?;
-                proxy_to_client.shutdown(Shutdown::Write)?;
-                Ok(())
-            }).expect("copy remote to client failed");
+            forward_stream(remote_to_proxy, proxy_to_client);
             Ok(())
         });
 
         let to_remote_handle: JoinHandle<io::Result<()>> = thread::spawn(move || {
-            copy(&mut client_to_proxy, &mut proxy_to_remote).and_then(|_| {
-                client_to_proxy.shutdown(Shutdown::Read)?;
-                proxy_to_remote.shutdown(Shutdown::Write)?;
-                Ok(())
-            }).expect("copy client to remote failed");
+            forward_stream(client_to_proxy, proxy_to_remote);
             Ok(())
         });
 
@@ -383,17 +400,17 @@ impl SocksConnection {
         self.client_stream.write(&response_buf[..length]);
         self.client_stream.flush();
         self.client_stream.shutdown(Shutdown::Both);
-        
+
     }
 
-    
+
     fn handle_stream(&mut self) -> std::result::Result<(), String> {
         self.connect_to_socks()?;
         let (socks_version, command, mut address_type, dst_socket_addr) =
             self.get_request_info()?;
         debug!("Socks version: {}, request command: {:#?}, address type: {:#?}, destination address: {}",
                socks_version, command, address_type, dst_socket_addr);
-        
+
         let remote_stream = match self.establish_connection(dst_socket_addr) {
             Ok(stream) => {
                 let (response_buf, length) = build_socks_response(socks_version,
@@ -437,9 +454,10 @@ impl Server {
         }
         Err(format!("Couldn't bind to address {}", full_address))
     }
-
     fn server_loop(&mut self) {
+        println!("started server on: {}", self.listener.local_addr().unwrap());
         for stream in self.listener.incoming() {
+
             info!("Attempting to handle connection");
             let mut socks_conn =
                 SocksConnection::new(stream.unwrap());
@@ -539,7 +557,7 @@ mod tests {
 
     #[test]
     fn localhost_sscce() {
-              
+
 
 
     }

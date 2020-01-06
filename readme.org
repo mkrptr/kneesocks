@@ -1,24 +1,23 @@
 * Kneesocks
-Kneesocks is a socks5 proxy server. Right now it supports basic multithreading, 
-but I'm going to rewrite it in mio soon.
+Kneesocks is a socks5 proxy server. I've written it for my own needs and is not suited for handling thousands of connections yet.
 
 * Getting Started
 ** Prerequisites
   - cargo
-** Installation 
+** Installation
   1. Clone this repository
   #+BEGIN_SRC sh
-  git clone https://yaddayadda 
+  git clone https://yaddayadda
   #+END_SRC
-  
+
   2. Move to kneesocks directory
   #+BEGIN_SRC sh
   cd kneesocks
   #+END_SRC
-   
+
   3. Build kneesocks
   #+BEGIN_SRC sh
-  cargo build 
+  cargo build
   #+END_SRC
 
 ** Usage
